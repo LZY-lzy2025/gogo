@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,11 +27,8 @@ const (
 	liveLinksFile       = "live_links.txt"
 	logFile             = "scraper_log.txt"
 	lockFile            = "task.lock"
-	candidateCacheFile  = "detail_candidates_cache.json"
 	retentionHours      = 4
 	timeWindowMinutes   = 45
-	cacheWindowHours    = 2
-	cacheRetryMinutes   = 5
 	listFetchTimeout    = 10 * time.Second
 	detailFetchTimeout  = 10 * time.Second
 	maxDetailConcurrent = 10
@@ -59,12 +55,6 @@ type item struct {
 	Timestamp  time.Time
 	DiffSecond int64
 	IsYest     bool
-}
-
-type cachedCandidates struct {
-	GeneratedAt int64            `json:"generated_at"`
-	NextRetryAt int64            `json:"next_retry_at,omitempty"`
-	Candidates  []matchCandidate `json:"candidates"`
 }
 
 func main() {
@@ -182,27 +172,30 @@ func runScrape(ctx context.Context) error {
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	retentionCutoff := todayStart.Add(-retentionHours * time.Hour)
 	timeWindowStart := now.Add(-timeWindowMinutes * time.Minute)
-	cacheWindowStart := now.Add(-cacheWindowHours * time.Hour)
-	cacheWindowEnd := now.Add(cacheWindowHours * time.Hour)
 
 	appendLog("--- Go 抓取任务启动 ---")
 
 	allItems, existingURLs, existingTitles := loadExistingItems(loc, now, todayStart, retentionCutoff)
 
-	candidates := loadCandidatesWithCache(ctx, loc, now, cacheWindowStart, cacheWindowEnd)
-	candidates = filterCandidatesByTime(candidates, timeWindowStart, now)
-	candidates = dedupCandidates(candidates)
+	listURLs := []string{baseURL + "/category/zuqiu", baseURL + "/category/lanqiu"}
+	listBodies := fetchURLs(ctx, listURLs, listFetchTimeout, 2)
 
+	candidates := make([]matchCandidate, 0, 64)
 	skipCount := 0
-	filteredCandidates := make([]matchCandidate, 0, len(candidates))
-	for _, c := range candidates {
-		if existingTitles[c.Title] {
-			skipCount++
+	for _, u := range listURLs {
+		body := listBodies[u]
+		if body == "" {
+			appendLog("分类页抓取失败: " + u)
 			continue
 		}
-		filteredCandidates = append(filteredCandidates, c)
+		for _, c := range parseListCandidates(body, timeWindowStart, now, loc) {
+			if existingTitles[c.Title] {
+				skipCount++
+				continue
+			}
+			candidates = append(candidates, c)
+		}
 	}
-	candidates = filteredCandidates
 	appendLog(fmt.Sprintf("发现 %d 场候选，前置标题跳过 %d", len(candidates), skipCount))
 
 	detailURLs := make([]string, 0, len(candidates))
@@ -409,7 +402,7 @@ func readMaybeGzip(r io.Reader, encoding string) (string, error) {
 	return string(b), err
 }
 
-func parseListCandidates(html string, winStart, winEnd time.Time, loc *time.Location) []matchCandidate {
+func parseListCandidates(html string, winStart, now time.Time, loc *time.Location) []matchCandidate {
 	tagRe := regexp.MustCompile(`(?is)<a[^>]*class="clearfix\s*"[^>]*>.*?</a>`)
 	timeRe := regexp.MustCompile(`(\d{2}:\d{2})`)
 	dateRe := regexp.MustCompile(`data-time="([^"]+)"`)
@@ -426,7 +419,7 @@ func parseListCandidates(html string, winStart, winEnd time.Time, loc *time.Loca
 			continue
 		}
 		ts, err := time.ParseInLocation("2006-01-02 15:04:05", dm[1]+" "+tm[1]+":00", loc)
-		if err != nil || ts.Before(winStart) || ts.After(winEnd) {
+		if err != nil || ts.Before(winStart) || ts.After(now) {
 			continue
 		}
 		home := "未知主队"
@@ -441,118 +434,6 @@ func parseListCandidates(html string, winStart, winEnd time.Time, loc *time.Loca
 		cands = append(cands, matchCandidate{Title: title, URL: hm[1], Time: tm[1], Block: getTimeBlock(tm[1]), Timestamp: ts})
 	}
 	return cands
-}
-
-func loadCandidatesWithCache(ctx context.Context, loc *time.Location, now, cacheWindowStart, cacheWindowEnd time.Time) []matchCandidate {
-	cached, err := readCandidateCache()
-	if err != nil {
-		appendLog("读取候选缓存失败: " + err.Error())
-	}
-
-	needRefresh := err != nil || cached.GeneratedAt == 0 || now.Sub(time.Unix(cached.GeneratedAt, 0)) >= cacheWindowHours*time.Hour
-	if needRefresh {
-		if cached.NextRetryAt > now.Unix() {
-			waitSec := cached.NextRetryAt - now.Unix()
-			appendLog(fmt.Sprintf("候选缓存刷新等待重试中，剩余 %d 秒", waitSec))
-			return cached.Candidates
-		}
-		refreshed, refreshErr := refreshCandidateCache(ctx, loc, now, cacheWindowStart, cacheWindowEnd)
-		if refreshErr != nil {
-			appendLog("刷新候选缓存失败: " + refreshErr.Error())
-			cached.NextRetryAt = now.Add(cacheRetryMinutes * time.Minute).Unix()
-			if writeErr := writeCandidateCache(cached); writeErr != nil {
-				appendLog("写入候选缓存重试时间失败: " + writeErr.Error())
-			}
-			if len(cached.Candidates) > 0 {
-				appendLog(fmt.Sprintf("继续使用旧候选缓存，%d 分钟后重试刷新", cacheRetryMinutes))
-				return cached.Candidates
-			}
-			return nil
-		}
-		return refreshed.Candidates
-	}
-	return cached.Candidates
-}
-
-func refreshCandidateCache(ctx context.Context, loc *time.Location, now, cacheWindowStart, cacheWindowEnd time.Time) (cachedCandidates, error) {
-	listURLs := []string{baseURL + "/category/zuqiu", baseURL + "/category/lanqiu"}
-	listBodies := fetchURLs(ctx, listURLs, listFetchTimeout, 2)
-	candidates := make([]matchCandidate, 0, 128)
-	failedCount := 0
-
-	for _, u := range listURLs {
-		body := listBodies[u]
-		if body == "" {
-			appendLog("分类页抓取失败: " + u)
-			failedCount++
-			continue
-		}
-		candidates = append(candidates, parseListCandidates(body, cacheWindowStart, cacheWindowEnd, loc)...)
-	}
-
-	if failedCount == len(listURLs) {
-		return cachedCandidates{}, errors.New("分类页全部抓取失败")
-	}
-
-	candidates = dedupCandidates(candidates)
-	cache := cachedCandidates{
-		GeneratedAt: now.Unix(),
-		NextRetryAt: 0,
-		Candidates:  candidates,
-	}
-	if err := writeCandidateCache(cache); err != nil {
-		return cachedCandidates{}, err
-	}
-	appendLog(fmt.Sprintf("候选缓存刷新完成(前后%d小时): %d 条", cacheWindowHours, len(candidates)))
-	return cache, nil
-}
-
-func filterCandidatesByTime(candidates []matchCandidate, start, end time.Time) []matchCandidate {
-	filtered := make([]matchCandidate, 0, len(candidates))
-	for _, c := range candidates {
-		if c.Timestamp.Before(start) || c.Timestamp.After(end) {
-			continue
-		}
-		filtered = append(filtered, c)
-	}
-	return filtered
-}
-
-func dedupCandidates(candidates []matchCandidate) []matchCandidate {
-	seen := make(map[string]bool, len(candidates))
-	out := make([]matchCandidate, 0, len(candidates))
-	for _, c := range candidates {
-		key := c.URL + "||" + c.Title
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, c)
-	}
-	return out
-}
-
-func readCandidateCache() (cachedCandidates, error) {
-	var cache cachedCandidates
-	b, err := os.ReadFile(candidateCacheFile)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return cache, nil
-		}
-		return cache, err
-	}
-	if err := json.Unmarshal(b, &cache); err != nil {
-		return cachedCandidates{}, err
-	}
-	return cache, nil
-}
-
-func writeCandidateCache(cache cachedCandidates) error {
-	b, err := json.Marshal(cache)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(candidateCacheFile, b, 0o644)
 }
 
 func extractM3U8(html string) string {

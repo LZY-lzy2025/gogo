@@ -612,11 +612,9 @@ func readMaybeGzip(r io.Reader, encoding string) (string, error) {
 func shortenLeagueName(name string) (string, bool) {
 	for full, short := range leagueShortNames {
 		if strings.Contains(name, full) {
-			// 命中字典，替换后立刻返回，标志位为 true
 			return strings.ReplaceAll(name, full, short), true
 		}
 	}
-	// 没有命中，返回原名，标志位为 false
 	return name, false
 }
 
@@ -655,17 +653,21 @@ func parseListCandidates(html string, winStart, now time.Time, loc *time.Locatio
 			league = strings.TrimSpace(m[1])
 		}
 
+		// 终极清理：彻底去除名字中的普通空格、制表符、换行符以及 HTML 的 &nbsp; 
+		home = strings.ReplaceAll(strings.Join(strings.Fields(home), ""), "&nbsp;", "")
+		away = strings.ReplaceAll(strings.Join(strings.Fields(away), ""), "&nbsp;", "")
+		league = strings.ReplaceAll(strings.Join(strings.Fields(league), ""), "&nbsp;", "")
+
 		// 1. 查字典，并获取是否命中标识 (isHit)
 		league, isHit := shortenLeagueName(league)
 
 		var title string
 		if isHit {
-			// 如果命中字典：保留被缩写的联赛名，并去掉多余空格和横杠
-			league = strings.ReplaceAll(league, " ", "")
+			// 如果命中字典：保留联赛名，并去掉横杠
 			league = strings.ReplaceAll(league, "-", "")
 			title = fmt.Sprintf("%s:%svs%s", league, home, away)
 		} else {
-			// 如果没有命中字典（冷门赛事）：直接丢弃联赛名，只保留队名
+			// 如果没有命中字典：直接丢弃联赛名
 			title = fmt.Sprintf("%svs%s", home, away)
 		}
 
@@ -708,6 +710,7 @@ func writeOutputs(items []item, today string) error {
 		for _, it := range items {
 			m3u.WriteString(fmt.Sprintf("#EXTINF:-1 group-title=\"直连线路\", [%s] %s\n", it.Time, it.Title))
 			m3u.WriteString(it.URL + "\n")
+			// 👇 TXT 写入格式：[直连线路]空格 + 名字 + 空格:空格 + 链接
 			txt.WriteString(fmt.Sprintf("[直连线路] %s : %s\n", it.Title, it.URL))
 		}
 	}

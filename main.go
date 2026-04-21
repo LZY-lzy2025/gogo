@@ -28,7 +28,7 @@ const (
 	logFile             = "scraper_log.txt"
 	lockFile            = "task.lock"
 	retentionHours      = 5 // 保留距现在前 5 小时
-	timeWindowMinutes   = 45
+	timeWindowMinutes   = 60
 	listFetchTimeout    = 10 * time.Second
 	detailFetchTimeout  = 10 * time.Second
 	listFetchRetries    = 3
@@ -316,7 +316,6 @@ func loadExistingItems(loc *time.Location, now, retentionCutoff time.Time) ([]it
 		timeStr := m[2] + ":" + m[3]
 		title := m[4]
 		
-		// 动态计算解析出来的时间是不是跨天了
 		dateStr := now.Format("2006-01-02")
 		ts, err := time.ParseInLocation("2006-01-02 15:04:05", dateStr+" "+timeStr+":00", loc)
 		if err == nil {
@@ -440,8 +439,6 @@ func parseListCandidates(html string, winStart, now time.Time, loc *time.Locatio
 	hrefRe := regexp.MustCompile(`href="([^"]+)"`)
 	homeRe := regexp.MustCompile(`(?is)class=["']team\s+zhudui[^"']*["'].*?<p>\s*([^<]+?)\s*</p>`)
 	awayRe := regexp.MustCompile(`(?is)class=["']team\s+kedui[^"']*["'].*?<p>\s*([^<]+?)\s*</p>`)
-	
-	// 新增：提取联赛名，锁定 eventtime 所在的块，避免匹配到比分
 	leagueRe := regexp.MustCompile(`(?is)eventtime[^>]*>.*?<em>\s*([^<]+?)\s*</em>`)
 
 	cands := make([]matchCandidate, 0, 64)
@@ -470,7 +467,11 @@ func parseListCandidates(html string, winStart, now time.Time, loc *time.Locatio
 			league = strings.TrimSpace(m[1])
 		}
 		
-		// 拼装标题格式：联赛名:主队vs客队
+		// 联赛名也去掉空格和横杠 -
+		league = strings.ReplaceAll(league, " ", "")
+		league = strings.ReplaceAll(league, "-", "")
+		
+		// 拼装标题格式
 		title := fmt.Sprintf("%s:%svs%s", league, home, away)
 		
 		cands = append(cands, matchCandidate{Title: title, URL: hm[1], Time: tm[1], Timestamp: ts})
@@ -524,3 +525,4 @@ func writeOutputs(items []item, today string) error {
 	}
 	return nil
 }
+

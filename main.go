@@ -27,7 +27,7 @@ const (
 	liveLinksFile       = "live_links.txt"
 	logFile             = "scraper_log.txt"
 	lockFile            = "task.lock"
-	retentionHours      = 4
+	retentionHours      = 5 // 改为保留距现在前 5 小时
 	timeWindowMinutes   = 45
 	listFetchTimeout    = 10 * time.Second
 	detailFetchTimeout  = 10 * time.Second
@@ -47,18 +47,14 @@ type matchCandidate struct {
 	Title     string
 	URL       string
 	Time      string
-	Block     string
 	Timestamp time.Time
 }
 
 type item struct {
-	Block      string
-	Time       string
-	Title      string
-	URL        string
-	Timestamp  time.Time
-	DiffSecond int64
-	IsYest     bool
+	Time      string
+	Title     string
+	URL       string
+	Timestamp time.Time
 }
 
 func main() {
@@ -173,13 +169,14 @@ func runScrape(ctx context.Context) error {
 
 	loc, _ := time.LoadLocation("Asia/Shanghai")
 	now := time.Now().In(loc)
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-	retentionCutoff := todayStart.Add(-retentionHours * time.Hour)
+	
+	// 计算保留的截止时间：当前时间往前推 5 小时
+	retentionCutoff := now.Add(-time.Duration(retentionHours) * time.Hour)
 	timeWindowStart := now.Add(-timeWindowMinutes * time.Minute)
 
 	appendLog("--- Go 抓取任务启动 ---")
 
-	allItems, existingURLs, existingTitles := loadExistingItems(loc, now, todayStart, retentionCutoff)
+	allItems, existingURLs, existingTitles := loadExistingItems(loc, now, retentionCutoff)
 
 	listURLs := []string{baseURL + "/category/zuqiu", baseURL + "/category/lanqiu"}
 	listBodies := fetchURLs(ctx, listURLs, listFetchTimeout, 2, listFetchRetries, listRetryWait, true)
@@ -231,25 +228,22 @@ func runScrape(ctx context.Context) error {
 			continue
 		}
 		c := candByURL[du]
-		isY := c.Timestamp.Before(todayStart)
+		
 		allItems = append(allItems, item{
-			Block:      c.Block,
-			Time:       c.Time,
-			Title:      c.Title,
-			URL:        cleanURL,
-			Timestamp:  c.Timestamp,
-			DiffSecond: int64(now.Sub(c.Timestamp).Abs() / time.Second),
-			IsYest:     isY,
+			Time:      c.Time,
+			Title:     c.Title,
+			URL:       cleanURL,
+			Timestamp: c.Timestamp,
 		})
 		existingURLs[cleanURL] = true
 		successCount++
 	}
 
+	// 核心排序逻辑：按距离当前时间的绝对时间差排序。时间差越小（越接近现在），越靠前。
 	sort.Slice(allItems, func(i, j int) bool {
-		if allItems[i].IsYest != allItems[j].IsYest {
-			return !allItems[i].IsYest
-		}
-		return allItems[i].DiffSecond < allItems[j].DiffSecond
+		diffI := now.Sub(allItems[i].Timestamp).Abs()
+		diffJ := now.Sub(allItems[j].Timestamp).Abs()
+		return diffI < diffJ
 	})
 
 	if err := writeOutputs(allItems, now.Format("2006-01-02")); err != nil {
@@ -286,7 +280,7 @@ func appendLog(msg string) {
 	_, _ = f.WriteString(line)
 }
 
-func loadExistingItems(loc *time.Location, now, todayStart, retentionCutoff time.Time) ([]item, map[string]bool, map[string]bool) {
+func loadExistingItems(loc *time.Location, now, retentionCutoff time.Time) ([]item, map[string]bool, map[string]bool) {
 	items := make([]item, 0, 256)
 	existingURLs := map[string]bool{}
 	existingTitles := map[string]bool{}
@@ -303,6 +297,7 @@ func loadExistingItems(loc *time.Location, now, todayStart, retentionCutoff time
 			lines = append(lines, line)
 		}
 	}
+	
 	infRe := regexp.MustCompile(`group-title="([^"]+)", \[(\d{2}):(\d{2})\] (.+)$`)
 	dateRe := regexp.MustCompile(`\((\d{4}-\d{2}-\d{2})\)`)
 	for i := 0; i < len(lines); i++ {
@@ -319,7 +314,7 @@ func loadExistingItems(loc *time.Location, now, todayStart, retentionCutoff time
 		if len(m) != 5 {
 			continue
 		}
-		block := strings.TrimPrefix(m[1], "昨日 ")
+		
 		timeStr := m[2] + ":" + m[3]
 		title := m[4]
 		dateStr := now.Format("2006-01-02")
@@ -327,17 +322,15 @@ func loadExistingItems(loc *time.Location, now, todayStart, retentionCutoff time
 			dateStr = dm[1]
 		}
 		ts, err := time.ParseInLocation("2006-01-02 15:04:05", dateStr+" "+timeStr+":00", loc)
+		// 丢弃距离现在超过 5 小时的旧数据
 		if err != nil || ts.Before(retentionCutoff) {
 			continue
 		}
 		items = append(items, item{
-			Block:      block,
-			Time:       timeStr,
-			Title:      title,
-			URL:        url,
-			Timestamp:  ts,
-			DiffSecond: int64(now.Sub(ts).Abs() / time.Second),
-			IsYest:     ts.Before(todayStart),
+			Time:      timeStr,
+			Title:     title,
+			URL:       url,
+			Timestamp: ts,
 		})
 		existingURLs[url] = true
 		existingTitles[title] = true
@@ -465,7 +458,7 @@ func parseListCandidates(html string, winStart, now time.Time, loc *time.Locatio
 			away = strings.TrimSpace(m[1])
 		}
 		title := fmt.Sprintf("%s-vs-%s(%s)", home, away, dm[1])
-		cands = append(cands, matchCandidate{Title: title, URL: hm[1], Time: tm[1], Block: getTimeBlock(tm[1]), Timestamp: ts})
+		cands = append(cands, matchCandidate{Title: title, URL: hm[1], Time: tm[1], Timestamp: ts})
 	}
 	return cands
 }
@@ -491,29 +484,6 @@ func normalizeStreamURL(raw string) string {
 	return strings.ReplaceAll(clean, "adaptive", "1080p")
 }
 
-func getTimeBlock(timeStr string) string {
-	if len(timeStr) < 2 {
-		return "未知时间"
-	}
-	hour, _ := strconv.Atoi(timeStr[:2])
-	switch {
-	case hour < 4:
-		return "00:00-04:00"
-	case hour < 8:
-		return "04:00-08:00"
-	case hour < 12:
-		return "08:00-12:00"
-	case hour < 16:
-		return "12:00-16:00"
-	case hour < 20:
-		return "16:00-20:00"
-	case hour <= 23:
-		return "20:00-24:00"
-	default:
-		return "未知时间"
-	}
-}
-
 func writeOutputs(items []item, today string) error {
 	var m3u strings.Builder
 	var txt strings.Builder
@@ -525,13 +495,10 @@ func writeOutputs(items []item, today string) error {
 		txt.WriteString("当前时段暂无符合条件的比赛\n")
 	} else {
 		for _, it := range items {
-			block := it.Block
-			if it.IsYest {
-				block = "昨日 " + block
-			}
-			m3u.WriteString(fmt.Sprintf("#EXTINF:-1 group-title=\"%s\", [%s] %s\n", block, it.Time, it.Title))
+			// 将 group-title 统一设为 "直连线路"
+			m3u.WriteString(fmt.Sprintf("#EXTINF:-1 group-title=\"直连线路\", [%s] %s\n", it.Time, it.Title))
 			m3u.WriteString(it.URL + "\n")
-			txt.WriteString(fmt.Sprintf("[%s] %s : %s\n", block, it.Title, it.URL))
+			txt.WriteString(fmt.Sprintf("[直连线路] %s : %s\n", it.Title, it.URL))
 		}
 	}
 

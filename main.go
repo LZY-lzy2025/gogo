@@ -27,7 +27,7 @@ const (
 	liveLinksFile       = "live_links.txt"
 	logFile             = "scraper_log.txt"
 	lockFile            = "task.lock"
-	retentionHours      = 5 // 改为保留距现在前 5 小时
+	retentionHours      = 5 // 保留距现在前 5 小时
 	timeWindowMinutes   = 45
 	listFetchTimeout    = 10 * time.Second
 	detailFetchTimeout  = 10 * time.Second
@@ -170,7 +170,6 @@ func runScrape(ctx context.Context) error {
 	loc, _ := time.LoadLocation("Asia/Shanghai")
 	now := time.Now().In(loc)
 	
-	// 计算保留的截止时间：当前时间往前推 5 小时
 	retentionCutoff := now.Add(-time.Duration(retentionHours) * time.Hour)
 	timeWindowStart := now.Add(-timeWindowMinutes * time.Minute)
 
@@ -239,7 +238,7 @@ func runScrape(ctx context.Context) error {
 		successCount++
 	}
 
-	// 核心排序逻辑：按距离当前时间的绝对时间差排序。时间差越小（越接近现在），越靠前。
+	// 绝对时间距离排序：时间差越小越排在前面
 	sort.Slice(allItems, func(i, j int) bool {
 		diffI := now.Sub(allItems[i].Timestamp).Abs()
 		diffJ := now.Sub(allItems[j].Timestamp).Abs()
@@ -299,7 +298,6 @@ func loadExistingItems(loc *time.Location, now, retentionCutoff time.Time) ([]it
 	}
 	
 	infRe := regexp.MustCompile(`group-title="([^"]+)", \[(\d{2}):(\d{2})\] (.+)$`)
-	dateRe := regexp.MustCompile(`\((\d{4}-\d{2}-\d{2})\)`)
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
 		if !strings.HasPrefix(line, "#EXTINF") {
@@ -317,12 +315,18 @@ func loadExistingItems(loc *time.Location, now, retentionCutoff time.Time) ([]it
 		
 		timeStr := m[2] + ":" + m[3]
 		title := m[4]
+		
+		// 动态计算解析出来的时间是不是跨天了
 		dateStr := now.Format("2006-01-02")
-		if dm := dateRe.FindStringSubmatch(title); len(dm) == 2 {
-			dateStr = dm[1]
-		}
 		ts, err := time.ParseInLocation("2006-01-02 15:04:05", dateStr+" "+timeStr+":00", loc)
-		// 丢弃距离现在超过 5 小时的旧数据
+		if err == nil {
+			if ts.Sub(now) > 12*time.Hour {
+				ts = ts.AddDate(0, 0, -1)
+			} else if now.Sub(ts) > 12*time.Hour {
+				ts = ts.AddDate(0, 0, 1)
+			}
+		}
+		
 		if err != nil || ts.Before(retentionCutoff) {
 			continue
 		}
@@ -436,6 +440,9 @@ func parseListCandidates(html string, winStart, now time.Time, loc *time.Locatio
 	hrefRe := regexp.MustCompile(`href="([^"]+)"`)
 	homeRe := regexp.MustCompile(`(?is)class=["']team\s+zhudui[^"']*["'].*?<p>\s*([^<]+?)\s*</p>`)
 	awayRe := regexp.MustCompile(`(?is)class=["']team\s+kedui[^"']*["'].*?<p>\s*([^<]+?)\s*</p>`)
+	
+	// 新增：提取联赛名，锁定 eventtime 所在的块，避免匹配到比分
+	leagueRe := regexp.MustCompile(`(?is)eventtime[^>]*>.*?<em>\s*([^<]+?)\s*</em>`)
 
 	cands := make([]matchCandidate, 0, 64)
 	for _, tag := range tagRe.FindAllString(html, -1) {
@@ -451,13 +458,21 @@ func parseListCandidates(html string, winStart, now time.Time, loc *time.Locatio
 		}
 		home := "未知主队"
 		away := "未知客队"
+		league := "未知联赛"
+
 		if m := homeRe.FindStringSubmatch(tag); len(m) == 2 {
 			home = strings.TrimSpace(m[1])
 		}
 		if m := awayRe.FindStringSubmatch(tag); len(m) == 2 {
 			away = strings.TrimSpace(m[1])
 		}
-		title := fmt.Sprintf("%s-vs-%s(%s)", home, away, dm[1])
+		if m := leagueRe.FindStringSubmatch(tag); len(m) == 2 {
+			league = strings.TrimSpace(m[1])
+		}
+		
+		// 拼装标题格式：联赛名:主队vs客队
+		title := fmt.Sprintf("%s:%svs%s", league, home, away)
+		
 		cands = append(cands, matchCandidate{Title: title, URL: hm[1], Time: tm[1], Timestamp: ts})
 	}
 	return cands
@@ -495,7 +510,6 @@ func writeOutputs(items []item, today string) error {
 		txt.WriteString("当前时段暂无符合条件的比赛\n")
 	} else {
 		for _, it := range items {
-			// 将 group-title 统一设为 "直连线路"
 			m3u.WriteString(fmt.Sprintf("#EXTINF:-1 group-title=\"直连线路\", [%s] %s\n", it.Time, it.Title))
 			m3u.WriteString(it.URL + "\n")
 			txt.WriteString(fmt.Sprintf("[直连线路] %s : %s\n", it.Title, it.URL))
